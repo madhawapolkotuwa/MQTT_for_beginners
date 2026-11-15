@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MQTT animation: QoS 0, 1 and 2 handshakes</title>
+<style>
+  :root { --bg: #f6f7f9; --card: #fff; --ink: #1f2937; --muted: #6b7280; --edge: #e5e7eb; --pub: #2563eb; --ok: #16a34a; --bad: #dc2626; --warn: #d97706; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--ink); }
+  header, main { max-width: 1120px; margin: 0 auto; padding: 0 20px; }
+  header { padding-top: 18px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  header p { margin: 0 0 12px; color: var(--muted); }
+  header a { color: var(--pub); }
+  main { display: grid; grid-template-columns: 280px minmax(0, 1fr); gap: 16px; padding-bottom: 24px; }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; } }
+  .card { background: var(--card); border: 1px solid var(--edge); border-radius: 12px; padding: 14px; }
+  h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 8px; }
+  .seg { display: flex; border: 1px solid #cbd5e1; border-radius: 10px; overflow: hidden; margin-bottom: 12px; }
+  .seg label { flex: 1; text-align: center; padding: 7px 0; cursor: pointer; font-weight: 600; }
+  .seg input { display: none; }
+  .seg label:has(input:checked) { background: var(--pub); color: #fff; }
+  .check { display: flex; gap: 8px; align-items: flex-start; margin: 6px 0 12px; font-size: 14px; }
+  button { font: inherit; border: 1px solid var(--pub); background: var(--pub); color: #fff; border-radius: 8px; padding: 7px 14px; cursor: pointer; width: 100%; }
+  .speed { font-size: 13px; color: var(--muted); margin-top: 12px; }
+  .speed input { width: 100%; }
+  .score { display: flex; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+  .score div { background: #f8fafc; border: 1px solid var(--edge); border-radius: 10px; padding: 6px 12px; font-size: 14px; }
+  .score b { font-size: 18px; }
+  svg { width: 100%; height: auto; display: block; }
+  ol#steps { margin: 0; padding-left: 22px; font-size: 14px; }
+  ol#steps li { margin-bottom: 6px; }
+  #verdict { margin-top: 10px; padding: 10px 12px; border-radius: 10px; background: #eff6ff; border: 1px solid #bfdbfe; font-size: 14px; display: none; }
+  .lifehead { font: 600 14px system-ui, sans-serif; fill: #111827; }
+  .side { font: 12px ui-monospace, Consolas, monospace; }
+  .lbl { font: 12px ui-monospace, Consolas, monospace; fill: #111827; }
+  .num { font: 600 11px system-ui, sans-serif; fill: #fff; }
+  .evt { font: 600 12.5px system-ui, sans-serif; fill: #92400e; }
+</style>
+</head>
+<body>
+<header>
+  <h1>QoS 0, 1 and 2: the delivery handshakes</h1>
+  <p>Pick a QoS level, optionally drop a packet, and press Play. Watch what each side remembers and how many times the receiving app actually gets the message. QoS applies to each hop separately (publisher to broker, then broker to subscriber); this shows one hop. <a href="index.html">All animations</a></p>
+</header>
+<main>
+  <aside class="card">
+    <h2>QoS level</h2>
+    <div class="seg" id="qosSeg">
+      <label><input type="radio" name="qos" value="0">QoS 0</label>
+      <label><input type="radio" name="qos" value="1" checked>QoS 1</label>
+      <label><input type="radio" name="qos" value="2">QoS 2</label>
+    </div>
+    <label class="check"><input type="checkbox" id="lose"> <span>Lose a packet: the connection drops at the worst possible moment</span></label>
+    <button id="play">▶ Play</button>
+    <div class="speed"><label for="speed">Speed</label><input type="range" id="speed" min="0.5" max="2.5" step="0.25" value="1"></div>
+    <h2 style="margin-top:16px">What happens</h2>
+    <ol id="steps"></ol>
+    <div id="verdict"></div>
+  </aside>
+  <section class="card">
+    <div class="score">
+      <div>Packets on the wire: <b id="pkts">0</b></div>
+      <div>Times the receiving app got the message: <b id="deliv">0</b></div>
+    </div>
+    <svg id="seq" viewBox="0 0 760 300" role="img" aria-label="Sequence diagram of the QoS handshake"></svg>
+  </section>
+</main>
+<script>
+(function () {
+  'use strict';
+  const NS = 'http://www.w3.org/2000/svg';
+  const C = { pub: '#2563eb', ack: '#16a34a', rel: '#7c3aed', bad: '#dc2626', warn: '#d97706', line: '#94a3b8', muted: '#6b7280' };
+  const XL = 230, XR = 530, TOP = 70, STEP = 58;
+
+  class Cancel extends Error {}
+  let runId = 0;
+  let speed = 1;
+
+  function el(tag, attrs, parent) {
+    const e = document.createElementNS(NS, tag);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(e);
+    return e;
+  }
+  function wait(ms) {
+    const id = runId;
+    return new Promise((res, rej) => setTimeout(() => (id === runId ? res() : rej(new Cancel())), ms / speed));
+  }
+  function tween(ms, fn) {
+    const id = runId;
+    return new Promise((res, rej) => {
+      const t0 = performance.now();
+      function frame(now) {
+        if (id !== runId) { rej(new Cancel()); return; }
+        const p = Math.min(1, (now - t0) / (ms / speed));
+        fn(p);
+        if (p < 1) requestAnimationFrame(frame); else res();
+      }
+      requestAnimationFrame(frame);
+    });
+  }
+
+  // ---------- scripts ----------
+  // m: message, e: event. dir 'r' = sender -> receiver, 'l' = receiver -> sender.
+  function script(qos, lose) {
+    const P = (q, dup) => 'PUBLISH' + (q ? ' id=7' : '') + ' QoS ' + q + (dup ? ' DUP' : '');
+    if (qos === 0) {
+      if (!lose) return {
+        steps: [
+          { t: 'm', dir: 'r', label: P(0), color: C.pub, left: 'sends, then forgets', right: 'hands it to the app', deliver: true,
+            note: 'The sender fires the PUBLISH once and keeps no copy. No packet ID, no acknowledgment.' }
+        ],
+        verdict: 'One packet, delivered once. QoS 0 is the cheapest option and works well on a stable link.'
+      };
+      return {
+        steps: [
+          { t: 'm', dir: 'r', label: P(0), color: C.pub, left: 'sends, then forgets', lost: true,
+            note: 'The connection drops while the packet is in flight.' },
+          { t: 'e', text: 'client reconnects', note: 'The client reconnects, but it kept no copy, so there is nothing to resend.' }
+        ],
+        verdict: 'Delivered zero times. "At most once" includes "never". Fine for a temperature reading that is resent every 10 seconds anyway.'
+      };
+    }
+    if (qos === 1) {
+      const first = { t: 'm', dir: 'r', label: P(1), color: C.pub, left: 'stores copy of msg 7', right: 'hands it to the app', deliver: true,
+        note: 'The sender gives the message packet ID 7 and keeps a copy until it is acknowledged.' };
+      if (!lose) return {
+        steps: [first,
+          { t: 'm', dir: 'l', label: 'PUBACK id=7', color: C.ack, left: 'deletes copy of msg 7',
+            note: 'The receiver confirms with PUBACK. The sender can now throw its copy away.' }],
+        verdict: 'Two packets, delivered once. That is the usual outcome for QoS 1.'
+      };
+      return {
+        steps: [first,
+          { t: 'm', dir: 'l', label: 'PUBACK id=7', color: C.ack, lost: true,
+            note: 'The connection drops before the PUBACK arrives. The sender cannot tell whether the message got through.' },
+          { t: 'e', text: 'connection drops · client reconnects, session resumes', note: 'The client reconnects with its session intact and resends everything still unacknowledged.' },
+          { t: 'm', dir: 'r', label: P(1, true), color: C.warn, left: 'resends stored copy', right: 'hands it to the app AGAIN', deliver: true,
+            note: 'The DUP flag says "you may have seen this before", but QoS 1 does not track that, so the app gets a duplicate.' },
+          { t: 'm', dir: 'l', label: 'PUBACK id=7', color: C.ack, left: 'deletes copy of msg 7', note: 'This time the PUBACK arrives.' }],
+        verdict: 'Delivered twice. "At least once" means duplicates can happen, so make your handlers safe to run twice (for example, store readings by timestamp).'
+      };
+    }
+    const first = { t: 'm', dir: 'r', label: P(2), color: C.pub, left: 'stores copy of msg 7', right: 'notes id 7, hands to app', deliver: true,
+      note: 'The sender keeps a copy. The receiver delivers the message and remembers that it has seen packet ID 7.' };
+    const rec = { t: 'm', dir: 'l', label: 'PUBREC id=7', color: C.ack, left: 'drops msg, keeps id 7',
+      note: 'PUBREC means "received". The sender can delete the message but must remember ID 7 is mid-handshake.' };
+    const rel = { t: 'm', dir: 'r', label: 'PUBREL id=7', color: C.rel, right: 'forgets id 7',
+      note: 'PUBREL means "release it". The receiver can now forget ID 7.' };
+    const comp = { t: 'm', dir: 'l', label: 'PUBCOMP id=7', color: C.ack, left: 'forgets id 7, done',
+      note: 'PUBCOMP means "complete". Both sides have cleaned up.' };
+    if (!lose) return {
+      steps: [first, rec, rel, comp],
+      verdict: 'Four packets, delivered exactly once. That certainty costs two extra round trips.'
+    };
+    return {
+      steps: [first,
+        { t: 'm', dir: 'l', label: 'PUBREC id=7', color: C.ack, lost: true, note: 'The connection drops and the PUBREC is lost.' },
+        { t: 'e', text: 'connection drops · client reconnects, session resumes', note: 'The client reconnects and resumes its session.' },
+        { t: 'm', dir: 'r', label: P(2, true), color: C.warn, left: 'resends stored copy', right: 'id 7 known: skip delivery',
+          note: 'The receiver already has ID 7 on file, so it recognises the duplicate and does not deliver it again.' },
+        rec, rel, comp],
+      verdict: 'Delivered exactly once even though a packet was lost. The remembered packet ID is what makes that possible.'
+    };
+  }
+
+  // ---------- rendering ----------
+  const svg = document.getElementById('seq');
+  const stepsEl = document.getElementById('steps');
+  const verdictEl = document.getElementById('verdict');
+  const pktsEl = document.getElementById('pkts');
+  const delivEl = document.getElementById('deliv');
+
+  function frameFor(n) {
+    const h = TOP + n * STEP + 40;
+    svg.setAttribute('viewBox', '0 0 760 ' + h);
+    svg.textContent = '';
+    [[XL, 'Sender (client)'], [XR, 'Receiver (broker)']].forEach(([x, name]) => {
+      el('rect', { x: x - 80, y: 10, width: 160, height: 34, rx: 8, fill: '#f1f5f9', stroke: '#cbd5e1' }, svg);
+      const t = el('text', { x, y: 32, 'text-anchor': 'middle', class: 'lifehead' }, svg); t.textContent = name;
+      el('line', { x1: x, y1: 44, x2: x, y2: h - 10, stroke: C.line, 'stroke-dasharray': '5 5' }, svg);
+    });
+    return el('g', {}, svg);
+  }
+
+  function sideNote(g, x, y, text, anchor, color) {
+    const t = el('text', { x, y, 'text-anchor': anchor, class: 'side', fill: color || '#374151', opacity: 0 }, g);
+    t.textContent = text;
+    return tween(250, (p) => t.setAttribute('opacity', p));
+  }
+
+  async function drawMessage(g, s, i, y) {
+    const x1 = s.dir === 'r' ? XL : XR;
+    const x2 = s.dir === 'r' ? XR : XL;
+    const y2 = y + 22;
+    const xEnd = s.lost ? (x1 + x2) / 2 : x2;
+    const yEnd = s.lost ? (y + y2) / 2 : y2;
+    if (s.left) await sideNote(g, XL - 12, y + 4, s.left, 'end', '#374151');
+    const line = el('line', { x1, y1: y, x2: x1, y2: y, stroke: s.color, 'stroke-width': 2.5 }, g);
+    const head = el('polygon', { points: '0,0 -10,-5 -10,5', fill: s.color, opacity: 0 }, g);
+    const lbl = el('text', { x: (x1 + x2) / 2, y: y - 6, 'text-anchor': 'middle', class: 'lbl' }, g);
+    lbl.textContent = s.label;
+    const badge = el('g', { transform: 'translate(' + x1 + ',' + y + ')' }, g);
+    el('circle', { r: 9, fill: s.color }, badge);
+    const n = el('text', { 'text-anchor': 'middle', y: 4, class: 'num' }, badge); n.textContent = i;
+    const dot = el('circle', { r: 7, fill: s.color }, g);
+    pktsEl.textContent = String(Number(pktsEl.textContent) + 1);
+
+    await tween(1100, (p) => {
+      const e = p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2;
+      const x = x1 + (xEnd - x1) * e;
+      const yy = y + (yEnd - y) * e;
+      line.setAttribute('x2', x); line.setAttribute('y2', yy);
+      dot.setAttribute('cx', x); dot.setAttribute('cy', yy);
+    });
+    dot.remove();
+    if (s.lost) {
+      line.setAttribute('stroke-dasharray', '6 5');
+      line.setAttribute('opacity', '0.6');
+      const xg = el('g', { transform: 'translate(' + xEnd + ',' + yEnd + ')' }, g);
+      el('circle', { r: 13, fill: '#fee2e2', stroke: C.bad, 'stroke-width': 2 }, xg);
+      el('path', { d: 'M-5,-5 L5,5 M5,-5 L-5,5', stroke: C.bad, 'stroke-width': 3, 'stroke-linecap': 'round' }, xg);
+      const lt = el('text', { x: xEnd, y: yEnd + 28, 'text-anchor': 'middle', class: 'side', fill: C.bad }, g);
+      lt.textContent = 'lost';
+      return;
+    }
+    const ang = Math.atan2(y2 - y, x2 - x1) * 180 / Math.PI;
+    head.setAttribute('transform', 'translate(' + x2 + ',' + y2 + ') rotate(' + ang + ')');
+    head.setAttribute('opacity', 1);
+    if (s.deliver) delivEl.textContent = String(Number(delivEl.textContent) + 1);
+    if (s.right) await sideNote(g, XR + 12, y2 + 4, s.right, 'start', s.deliver ? C.ack : (s.color === C.warn ? C.warn : '#374151'));
+  }
+
+  async function drawEvent(g, s, y) {
+    const band = el('rect', { x: 40, y: y - 6, width: 680, height: 30, rx: 8, fill: '#fef3c7', stroke: '#fcd34d', opacity: 0 }, g);
+    const t = el('text', { x: 380, y: y + 14, 'text-anchor': 'middle', class: 'evt', opacity: 0 }, g);
+    t.textContent = '⚡ ' + s.text;
+    await tween(400, (p) => { band.setAttribute('opacity', p); t.setAttribute('opacity', p); });
+  }
+
+  async function run() {
+    runId += 1;
+    const qos = Number(document.querySelector('input[name=qos]:checked').value);
+    const lose = document.getElementById('lose').checked;
+    const sc = script(qos, lose);
+    const g = frameFor(sc.steps.length);
+    stepsEl.textContent = '';
+    verdictEl.style.display = 'none';
+    pktsEl.textContent = '0';
+    delivEl.textContent = '0';
+    try {
+      await wait(300);
+      let num = 0;
+      for (let i = 0; i < sc.steps.length; i++) {
+        const s = sc.steps[i];
+        const y = TOP + i * STEP + 14;
+        const li = document.createElement('li');
+        li.textContent = s.note;
+        if (s.t === 'm') { num += 1; li.value = num; }
+        else { li.style.listStyle = 'none'; li.style.color = '#92400e'; li.textContent = '⚡ ' + s.note; }
+        stepsEl.appendChild(li);
+        if (s.t === 'm') await drawMessage(g, s, num, y);
+        else await drawEvent(g, s, y);
+        await wait(550);
+      }
+      verdictEl.textContent = sc.verdict;
+      verdictEl.style.display = 'block';
+    } catch (e) {
+      if (!(e instanceof Cancel)) throw e;
+    }
+  }
+
+  document.getElementById('play').addEventListener('click', run);
+  document.querySelectorAll('input[name=qos]').forEach((r) => r.addEventListener('change', run));
+  document.getElementById('lose').addEventListener('change', run);
+  document.getElementById('speed').addEventListener('input', (e) => { speed = Number(e.target.value); });
+  run();
+})();
+</script>
+</body>
+</html>

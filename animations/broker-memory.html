@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MQTT animation: retained messages, Last Will and persistent sessions</title>
+<style>
+  :root { --bg: #f6f7f9; --card: #fff; --ink: #1f2937; --muted: #6b7280; --edge: #e5e7eb; --pub: #2563eb; --broker: #7c3aed; --ok: #16a34a; --bad: #dc2626; --warn: #d97706; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--ink); }
+  header, main { max-width: 1120px; margin: 0 auto; padding: 0 20px; }
+  header { padding-top: 18px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  header p { margin: 0 0 12px; color: var(--muted); }
+  header a { color: var(--pub); }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 330px; gap: 16px; padding-bottom: 24px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .card { background: var(--card); border: 1px solid var(--edge); border-radius: 12px; padding: 14px; }
+  h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 8px; }
+  .tabs { display: flex; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; }
+  .tabs button { font: 600 14px system-ui, sans-serif; border: 1px solid #cbd5e1; background: #f8fafc; color: var(--ink); border-radius: 999px; padding: 6px 14px; cursor: pointer; }
+  .tabs button.on { background: var(--broker); border-color: var(--broker); color: #fff; }
+  .variants { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; font-size: 14px; }
+  .variants label { display: flex; gap: 8px; align-items: center; cursor: pointer; }
+  .play { font: inherit; border: 1px solid var(--pub); background: var(--pub); color: #fff; border-radius: 8px; padding: 7px 14px; cursor: pointer; width: 100%; }
+  .speed { font-size: 13px; color: var(--muted); margin-top: 10px; }
+  .speed input { width: 100%; }
+  #intro { font-size: 14px; color: #374151; margin: 0 0 10px; }
+  ol#story { margin: 0; padding-left: 20px; font-size: 14px; }
+  ol#story li { margin-bottom: 6px; }
+  ol#story li.key { color: #5b21b6; font-weight: 600; }
+  svg { width: 100%; height: auto; display: block; }
+  .node-title { font: 600 14px system-ui, sans-serif; fill: #111827; }
+  .node-sub { font: 12px ui-monospace, Consolas, monospace; fill: #374151; }
+  .node-last { font: 11.5px ui-monospace, Consolas, monospace; fill: #6b7280; }
+  .store-title { font: 600 12.5px system-ui, sans-serif; fill: #5b21b6; }
+  .store-row { white-space: pre; font: 12px ui-monospace, Consolas, monospace; fill: #1f2937; }
+  .pkt text { font: 11.5px ui-monospace, Consolas, monospace; fill: #fff; }
+  .tag { font: 600 12px system-ui, sans-serif; }
+</style>
+</head>
+<body>
+<header>
+  <h1>What the broker remembers: retained messages, Last Will and sessions</h1>
+  <p>Three features, one idea: the broker can hold on to information when a client is not around. Pick a scenario, flip the toggle to compare the two behaviours, and press Play. The purple box under the broker shows what it is storing. <a href="index.html">All animations</a></p>
+</header>
+<main>
+  <section class="card">
+    <svg id="stage" viewBox="0 0 760 420" role="img" aria-label="Publisher, broker with storage, and two subscribers">
+      <g id="links"></g>
+      <g id="nodes"></g>
+      <g id="fx"></g>
+      <g id="packets"></g>
+    </svg>
+  </section>
+  <aside class="card">
+    <div class="tabs" id="tabs"></div>
+    <p id="intro"></p>
+    <div class="variants" id="variants"></div>
+    <button class="play" id="play">▶ Play</button>
+    <div class="speed"><label for="speed">Speed</label><input type="range" id="speed" min="0.5" max="2.5" step="0.25" value="1"></div>
+    <h2 style="margin-top:14px">Step by step</h2>
+    <ol id="story"></ol>
+  </aside>
+</main>
+<script>
+(function () {
+  'use strict';
+  const NS = 'http://www.w3.org/2000/svg';
+  const C = { pub: '#2563eb', broker: '#7c3aed', ok: '#16a34a', bad: '#dc2626', warn: '#d97706', edge: '#cbd5e1', off: '#9ca3af', ctl: '#475569' };
+
+  class Cancel extends Error {}
+  let runId = 0;
+  let speed = 1;
+
+  function el(tag, attrs, parent) {
+    const e = document.createElementNS(NS, tag);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(e);
+    return e;
+  }
+  function wait(ms) {
+    const id = runId;
+    return new Promise((res, rej) => setTimeout(() => (id === runId ? res() : rej(new Cancel())), ms / speed));
+  }
+  function tween(ms, fn) {
+    const id = runId;
+    return new Promise((res, rej) => {
+      const t0 = performance.now();
+      function frame(now) {
+        if (id !== runId) { rej(new Cancel()); return; }
+        const p = Math.min(1, (now - t0) / (ms / speed));
+        fn(p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2);
+        if (p < 1) requestAnimationFrame(frame); else res();
+      }
+      requestAnimationFrame(frame);
+    });
+  }
+
+  // ---------- stage ----------
+  const gLinks = document.getElementById('links');
+  const gNodes = document.getElementById('nodes');
+  const gFx = document.getElementById('fx');
+  const gPkts = document.getElementById('packets');
+
+  const POS = { pub: { x: 100, y: 160 }, broker: { x: 380, y: 160 }, a: { x: 660, y: 90 }, b: { x: 660, y: 290 } };
+  const W = 170, H = 80;
+
+  function makeNode(key, color) {
+    const p = POS[key];
+    const g = el('g', { transform: 'translate(' + p.x + ',' + p.y + ')' }, gNodes);
+    const rect = el('rect', { x: -W / 2, y: -H / 2, width: W, height: H, rx: 12, fill: '#fff', stroke: color, 'stroke-width': 2 }, g);
+    const t1 = el('text', { class: 'node-title', 'text-anchor': 'middle', y: -14 }, g);
+    const t2 = el('text', { class: 'node-sub', 'text-anchor': 'middle', y: 6 }, g);
+    const t3 = el('text', { class: 'node-last', 'text-anchor': 'middle', y: 26 }, g);
+    return { g, rect, t1, t2, t3, color };
+  }
+  const nodes = {
+    pub: makeNode('pub', C.pub),
+    broker: makeNode('broker', C.broker),
+    a: makeNode('a', C.ok),
+    b: makeNode('b', C.ok)
+  };
+
+  // link endpoints: edge of source box toward target box
+  function ends(from, to) {
+    const a = POS[from], b = POS[to];
+    const dir = Math.sign(b.x - a.x);
+    return { x1: a.x + dir * W / 2, y1: a.y, x2: b.x - dir * W / 2, y2: b.y };
+  }
+  const links = {};
+  [['pub', 'broker'], ['broker', 'a'], ['broker', 'b']].forEach(([f, t]) => {
+    const e = ends(f, t);
+    links[f === 'pub' ? 'pub' : t] = el('line', { x1: e.x1, y1: e.y1, x2: e.x2, y2: e.y2, stroke: C.edge, 'stroke-width': 2 }, gLinks);
+  });
+
+  // storage box under the broker
+  const store = el('g', { transform: 'translate(' + (POS.broker.x - 125) + ',235)' }, gNodes);
+  el('line', { x1: 125, y1: -35, x2: 125, y2: 0, stroke: C.broker, 'stroke-dasharray': '3 3' }, store);
+  const storeBox = el('rect', { x: 0, y: 0, width: 250, height: 162, rx: 10, fill: '#f5f3ff', stroke: '#c4b5fd' }, store);
+  const storeTitle = el('text', { x: 12, y: 22, class: 'store-title' }, store);
+  const storeRows = el('g', {}, store);
+
+  function setStore(title, rows) {
+    storeTitle.textContent = title;
+    storeRows.textContent = '';
+    (rows.length ? rows : ['(empty)']).forEach((r, i) => {
+      const t = el('text', { x: 12, y: 46 + i * 20, class: 'store-row' }, storeRows);
+      t.textContent = r;
+      if (!rows.length) t.setAttribute('fill', '#9ca3af');
+    });
+  }
+  async function pulseStore() {
+    await tween(300, (p) => storeBox.setAttribute('fill', p < 1 ? '#ddd6fe' : '#f5f3ff'));
+    storeBox.setAttribute('fill', '#f5f3ff');
+  }
+
+  function setNode(key, o) {
+    const n = nodes[key];
+    if ('title' in o) n.t1.textContent = o.title;
+    if ('sub' in o) n.t2.textContent = o.sub;
+    if ('last' in o) n.t3.textContent = o.last;
+    if ('show' in o) { n.g.style.display = o.show ? '' : 'none'; if (links[key]) links[key].style.display = o.show ? '' : 'none'; }
+    if ('online' in o) {
+      n.g.setAttribute('opacity', o.online ? 1 : 0.45);
+      setLink(key, o.online ? 'ok' : 'off');
+    }
+  }
+  function setLink(key, state) {
+    const l = links[key];
+    if (!l) return;
+    l.removeAttribute('stroke-dasharray');
+    if (state === 'ok') l.setAttribute('stroke', C.edge);
+    if (state === 'off') { l.setAttribute('stroke', C.off); l.setAttribute('stroke-dasharray', '3 6'); }
+    if (state === 'broken') { l.setAttribute('stroke', C.bad); l.setAttribute('stroke-dasharray', '8 6'); }
+  }
+
+  // floating label near a point, removed on reset
+  function tag(x, y, text, color) {
+    const t = el('text', { x, y, 'text-anchor': 'middle', class: 'tag', fill: color }, gFx);
+    t.textContent = text;
+    return t;
+  }
+
+  async function send(from, to, label, color) {
+    const e = ends(from, to);
+    const g = el('g', { class: 'pkt' }, gPkts);
+    const w = Math.max(48, label.length * 7 + 18);
+    el('rect', { x: -w / 2, y: -12, width: w, height: 24, rx: 12, fill: color }, g);
+    const t = el('text', { 'text-anchor': 'middle', y: 4 }, g); t.textContent = label;
+    try {
+      await tween(1200, (p) => g.setAttribute('transform', 'translate(' + (e.x1 + (e.x2 - e.x1) * p) + ',' + (e.y1 + (e.y2 - e.y1) * p) + ')'));
+    } finally {
+      g.remove();
+    }
+  }
+
+  // ---------- narration ----------
+  const story = document.getElementById('story');
+  function say(text, key) {
+    const li = document.createElement('li');
+    li.textContent = text;
+    if (key) li.className = 'key';
+    story.appendChild(li);
+  }
+
+  function reset() {
+    gFx.textContent = '';
+    gPkts.textContent = '';
+    story.textContent = '';
+    Object.keys(nodes).forEach((k) => setNode(k, { show: true, online: true, last: '' }));
+    setNode('broker', { title: 'Broker', sub: 'routes + remembers', last: '' });
+  }
+
+  // ---------- scenarios ----------
+  const scenarios = {
+    retained: {
+      name: 'Retained messages',
+      intro: 'A retained message is the "last known value" for a topic. The broker keeps one per topic and hands it to anyone who subscribes later.',
+      variants: [['on', 'Publish with the retain flag set'], ['off', 'Publish without the retain flag']],
+      async run(v) {
+        const retain = v === 'on';
+        setNode('pub', { title: 'Door sensor', sub: 'home/door', last: '' });
+        setNode('a', { title: 'Phone app', sub: 'home/door', last: 'subscribed' });
+        setNode('b', { show: false, title: 'Tablet', sub: 'home/door', last: '' });
+        setStore('Retained messages', []);
+        say('The phone app is already subscribed to home/door.');
+        await wait(500);
+        say('The door sensor publishes "locked"' + (retain ? ' with retain = true.' : ' with retain = false.'));
+        await send('pub', 'broker', 'PUBLISH home/door "locked"' + (retain ? ' R' : ''), C.pub);
+        if (retain) {
+          setStore('Retained messages', ['home/door  →  "locked"']);
+          await pulseStore();
+          say('Because of the retain flag, the broker saves it as the last known value for home/door.', true);
+        } else {
+          say('No retain flag, so the broker forwards it and keeps nothing.');
+        }
+        await send('broker', 'a', '"locked"', C.ok);
+        setNode('a', { last: 'door = locked' });
+        say('The phone app receives it right away, either way.');
+        await wait(900);
+        say('An hour later, a tablet joins and subscribes to home/door.');
+        setNode('b', { show: true, last: 'just connected' });
+        await send('b', 'broker', 'SUBSCRIBE home/door', C.ctl);
+        if (retain) {
+          await pulseStore();
+          await send('broker', 'b', '"locked" (retained)', C.warn);
+          setNode('b', { last: 'door = locked' });
+          say('The broker immediately sends the retained value. The tablet knows the door state without waiting.', true);
+        } else {
+          setNode('b', { last: 'door = ??? (waiting)' });
+          tag(POS.b.x, POS.b.y + 62, 'no data until the next publish', C.bad);
+          say('Nothing arrives. The tablet has no idea whether the door is locked until the sensor publishes again, which might be hours away.', true);
+        }
+      }
+    },
+    will: {
+      name: 'Last Will',
+      intro: 'When a client connects it can leave a "will": a message the broker publishes for it if the client vanishes without saying goodbye.',
+      variants: [['abrupt', 'Sensor dies abruptly (battery, network)'], ['clean', 'Sensor sends a clean DISCONNECT']],
+      async run(v) {
+        const abrupt = v === 'abrupt';
+        setNode('pub', { title: 'Sensor 42', sub: 'keep-alive 10 s', last: '' });
+        setNode('a', { title: 'Dashboard', sub: 'sensors/+/status', last: 'subscribed' });
+        setNode('b', { show: false });
+        setStore('Wills on file', []);
+        say('The dashboard subscribes to sensors/+/status.');
+        await wait(400);
+        say('Sensor 42 connects and registers a will: topic sensors/42/status, payload "offline".');
+        await send('pub', 'broker', 'CONNECT + will "offline"', C.ctl);
+        setStore('Wills on file', ['client: sensor-42', 'topic:  sensors/42/status', 'payload: "offline"']);
+        await pulseStore();
+        say('The broker stores the will. Nothing is published yet.', true);
+        await send('pub', 'broker', 'PUBLISH status "online"', C.pub);
+        await send('broker', 'a', '"online"', C.ok);
+        setNode('a', { last: 'sensor 42: online' });
+        say('The sensor announces itself as online, and the dashboard shows it.');
+        await wait(700);
+        if (abrupt) {
+          setLink('pub', 'broken');
+          nodes.pub.g.setAttribute('opacity', 0.45);
+          tag((POS.pub.x + POS.broker.x) / 2, POS.pub.y - 18, '⚡ connection lost', C.bad);
+          say('The sensor\'s battery dies. No DISCONNECT is sent, so the broker just stops hearing from it.');
+          const timer = tag(POS.broker.x, POS.broker.y - 52, '', C.warn);
+          for (let s = 15; s >= 0; s--) {
+            timer.textContent = 'silence… ' + s + ' s left';
+            await wait(110);
+          }
+          timer.textContent = 'keep-alive expired';
+          say('After 1.5 × the keep-alive (15 s) with no packets, the broker declares the sensor gone.');
+          await pulseStore();
+          await send('broker', 'a', 'sensors/42/status "offline"', C.warn);
+          setStore('Wills on file', []);
+          setNode('a', { last: 'sensor 42: OFFLINE' });
+          say('The broker publishes the will on the sensor\'s behalf. The dashboard learns about the failure without polling.', true);
+        } else {
+          await send('pub', 'broker', 'DISCONNECT', C.ctl);
+          setNode('pub', { online: false });
+          setStore('Wills on file', []);
+          await pulseStore();
+          say('A clean DISCONNECT tells the broker the exit was intentional, so it throws the will away.', true);
+          tag(POS.a.x, POS.a.y + 62, 'no will published', C.ctl);
+          say('Tip: a well-behaved client publishes its own "offline" status before disconnecting, so both paths end in the same state.');
+        }
+      }
+    },
+    session: {
+      name: 'Persistent session',
+      intro: 'A persistent session lets the broker remember a client\'s subscriptions and queue its QoS 1/2 messages while it is offline.',
+      variants: [['persist', 'Persistent session (Clean Start = 0)'], ['clean', 'Clean session (Clean Start = 1)']],
+      async run(v) {
+        const persist = v === 'persist';
+        const cs = persist ? 'clean=0' : 'clean=1';
+        setNode('pub', { title: 'Alarm panel', sub: 'alerts/…', last: '' });
+        setNode('a', { title: 'Phone', sub: 'client id "phone"', last: '' });
+        setNode('b', { show: false });
+        setStore('Session for "phone"', []);
+        say('The phone connects with ' + (persist ? 'Clean Start = 0 (and, in MQTT 5, a session expiry > 0).' : 'Clean Start = 1.'));
+        await send('a', 'broker', 'CONNECT ' + cs, C.ctl);
+        await send('broker', 'a', 'CONNACK', C.ctl);
+        await send('a', 'broker', 'SUBSCRIBE alerts/# QoS 1', C.ctl);
+        setStore('Session for "phone"', ['sub: alerts/#  (QoS 1)']);
+        await pulseStore();
+        setNode('a', { last: 'subscribed' });
+        say('It subscribes to alerts/# at QoS 1. The broker records the subscription in the session.');
+        await wait(600);
+        setNode('a', { online: false, last: 'in a tunnel' });
+        say('The phone loses signal.');
+        if (persist) {
+          setStore('Session for "phone"', ['sub: alerts/#  (QoS 1)', 'queue: (empty)']);
+          say('The session survives the disconnect.', true);
+        } else {
+          setStore('Session for "phone"', []);
+          say('With a clean session, the broker deletes everything about the phone the moment it disconnects.', true);
+        }
+        await pulseStore();
+        const alerts = ['alerts/smoke', 'alerts/door', 'alerts/water'];
+        const queued = [];
+        for (const t of alerts) {
+          await send('pub', 'broker', 'PUBLISH ' + t + ' QoS 1', C.pub);
+          if (persist) {
+            queued.push('  ' + t);
+            setStore('Session for "phone"', ['sub: alerts/#  (QoS 1)', 'queue:'].concat(queued));
+            await pulseStore();
+          } else {
+            const x = tag(POS.broker.x, POS.broker.y - 52, '✗ no subscriber: dropped', C.bad);
+            await wait(500);
+            x.remove();
+          }
+        }
+        say(persist ? 'Three alerts arrive. The broker queues them for the phone.' : 'Three alerts arrive. Nobody is subscribed, so the broker drops them.');
+        await wait(600);
+        setNode('a', { online: true, last: 'back online' });
+        say('The phone comes back with the same client id.');
+        await send('a', 'broker', 'CONNECT ' + cs, C.ctl);
+        if (persist) {
+          await send('broker', 'a', 'CONNACK session present', C.ctl);
+          say('The broker answers "session present" and replays the queue in order.', true);
+          let n = 0;
+          for (const t of alerts) {
+            await send('broker', 'a', t, C.ok);
+            queued.shift();
+            n += 1;
+            setStore('Session for "phone"', ['sub: alerts/#  (QoS 1)', 'queue:'].concat(queued.length ? queued : ['  (empty)']));
+            setNode('a', { last: 'got ' + n + ' missed alert' + (n > 1 ? 's' : '') });
+          }
+          say('Nothing was lost, and the phone did not need to subscribe again.');
+        } else {
+          await send('broker', 'a', 'CONNACK no session', C.ctl);
+          setNode('a', { last: '0 alerts, must resubscribe' });
+          tag(POS.a.x, POS.a.y + 62, 'missed 3 alerts', C.bad);
+          say('A fresh start: no subscription, no queued messages. The three alerts are gone for good.', true);
+        }
+      }
+    }
+  };
+
+  // ---------- controls ----------
+  const tabsEl = document.getElementById('tabs');
+  const introEl = document.getElementById('intro');
+  const varEl = document.getElementById('variants');
+  let current = 'retained';
+
+  function renderControls() {
+    tabsEl.textContent = '';
+    Object.keys(scenarios).forEach((k) => {
+      const b = document.createElement('button');
+      b.textContent = scenarios[k].name;
+      if (k === current) b.className = 'on';
+      b.addEventListener('click', () => { current = k; renderControls(); play(); });
+      tabsEl.appendChild(b);
+    });
+    const sc = scenarios[current];
+    introEl.textContent = sc.intro;
+    varEl.textContent = '';
+    sc.variants.forEach(([val, text], i) => {
+      const lab = document.createElement('label');
+      const r = document.createElement('input');
+      r.type = 'radio'; r.name = 'variant'; r.value = val; r.checked = i === 0;
+      r.addEventListener('change', play);
+      lab.append(r, document.createTextNode(text));
+      varEl.appendChild(lab);
+    });
+  }
+
+  async function play() {
+    runId += 1;
+    const id = runId;
+    reset();
+    const v = document.querySelector('input[name=variant]:checked').value;
+    try {
+      await wait(300);
+      await scenarios[current].run(v);
+    } catch (e) {
+      if (!(e instanceof Cancel)) throw e;
+      if (id === runId) gPkts.textContent = '';
+    }
+  }
+
+  document.getElementById('play').addEventListener('click', play);
+  document.getElementById('speed').addEventListener('input', (e) => { speed = Number(e.target.value); });
+  renderControls();
+  play();
+})();
+</script>
+</body>
+</html>

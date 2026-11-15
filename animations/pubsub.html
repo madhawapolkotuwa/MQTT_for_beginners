@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MQTT animation: publish/subscribe and topic wildcards</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --ink: #1f2937; --muted: #6b7280; --edge: #e5e7eb;
+    --pub: #2563eb; --broker: #7c3aed; --ok: #16a34a; --bad: #dc2626;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--ink); }
+  header, main { max-width: 1120px; margin: 0 auto; padding: 0 20px; }
+  header { padding-top: 18px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  header p { margin: 0 0 12px; color: var(--muted); }
+  header a { color: var(--pub); }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 16px; padding-bottom: 24px; }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; } }
+  .card { background: var(--card); border: 1px solid var(--edge); border-radius: 12px; padding: 14px; }
+  h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 8px; }
+  svg { width: 100%; height: auto; display: block; }
+  .btns { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+  button { font: 13px ui-monospace, Consolas, monospace; border: 1px solid #cbd5e1; background: #f8fafc; border-radius: 8px; padding: 5px 9px; cursor: pointer; color: var(--ink); }
+  button:hover { background: #eef2ff; border-color: var(--pub); }
+  button.primary { background: var(--pub); color: #fff; border-color: var(--pub); font-family: inherit; }
+  label { display: block; font-size: 13px; color: var(--muted); margin: 8px 0 2px; }
+  input[type=text] { width: 100%; font: 13px ui-monospace, Consolas, monospace; padding: 6px 8px; border: 1px solid #cbd5e1; border-radius: 8px; }
+  input.invalid { border-color: var(--bad); background: #fef2f2; }
+  .err { color: var(--bad); font-size: 12px; min-height: 16px; }
+  .row { display: flex; gap: 6px; align-items: end; }
+  .row > div { flex: 1; }
+  #log { font: 12.5px/1.45 ui-monospace, Consolas, monospace; max-height: 260px; overflow-y: auto; margin: 0; padding: 0; list-style: none; }
+  #log li { padding: 4px 0; border-bottom: 1px dashed var(--edge); }
+  .yes { color: var(--ok); } .no { color: var(--bad); } .dim { color: var(--muted); }
+  .node-title { font: 600 14px system-ui, sans-serif; fill: #111827; }
+  .node-sub { font: 12px ui-monospace, Consolas, monospace; fill: #374151; }
+  .node-last { font: 11.5px ui-monospace, Consolas, monospace; fill: var(--muted); }
+  .pkt text { font: 11.5px ui-monospace, Consolas, monospace; fill: #fff; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Publish/subscribe and topic wildcards</h1>
+  <p>Publish a message and watch the broker route it. It compares the topic against every subscriber's filter and forwards copies only to the ones that match. Edit the filters on the right to try your own wildcards. <a href="index.html">All animations</a></p>
+</header>
+<main>
+  <section class="card">
+    <svg id="stage" viewBox="0 0 760 420" role="img" aria-label="Publisher, broker and three subscribers">
+      <g id="links"></g>
+      <g id="nodes"></g>
+      <g id="packets"></g>
+    </svg>
+  </section>
+  <aside>
+    <div class="card">
+      <h2>Publish</h2>
+      <div class="btns" id="presets"></div>
+      <div class="row">
+        <div><label for="topic">Custom topic</label><input type="text" id="topic" value="home/livingroom/temperature"></div>
+      </div>
+      <div class="err" id="topicErr"></div>
+      <div class="row">
+        <div><label for="payload">Payload</label><input type="text" id="payload" value="22.0"></div>
+        <button class="primary" id="send">Publish</button>
+      </div>
+      <div class="btns" style="margin-top:10px"><button class="primary" id="tour">Play a guided tour</button></div>
+    </div>
+    <div class="card" style="margin-top:12px">
+      <h2>Subscriber filters</h2>
+      <div id="filters"></div>
+    </div>
+  </aside>
+  <section class="card" style="grid-column: 1 / -1">
+    <h2>Broker log</h2>
+    <ul id="log"><li class="dim">Click a topic button to publish.</li></ul>
+  </section>
+</main>
+<script>
+(function () {
+  'use strict';
+  const NS = 'http://www.w3.org/2000/svg';
+  const C = { pub: '#2563eb', broker: '#7c3aed', ok: '#16a34a', bad: '#dc2626', node: '#ffffff', edge: '#cbd5e1' };
+
+  function el(tag, attrs, parent) {
+    const e = document.createElementNS(NS, tag);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(e);
+    return e;
+  }
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const ease = (p) => (p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2);
+
+  const stage = document.getElementById('stage');
+  const gLinks = document.getElementById('links');
+  const gNodes = document.getElementById('nodes');
+  const gPkts = document.getElementById('packets');
+
+  const PUB = { x: 90, y: 210 };
+  const BROKER = { x: 380, y: 210 };
+  const subs = [
+    { name: 'Phone app', filter: 'home/#', y: 75 },
+    { name: 'Thermostat', filter: 'home/+/temperature', y: 210 },
+    { name: 'Kitchen display', filter: 'home/kitchen/+', y: 345 }
+  ];
+  const SUB_X = 650;
+
+  // ---------- topic rules ----------
+  function filterError(f) {
+    if (!f) return 'Filter is empty.';
+    const lv = f.split('/');
+    for (let i = 0; i < lv.length; i++) {
+      const l = lv[i];
+      if (l.includes('#') && (l !== '#' || i !== lv.length - 1)) return '"#" must be a whole level and the last one.';
+      if (l.includes('+') && l !== '+') return '"+" must fill a whole level, e.g. home/+/temp.';
+    }
+    return null;
+  }
+  function topicError(t) {
+    if (!t) return 'Topic is empty.';
+    if (t.includes('+') || t.includes('#')) return 'Wildcards are only for subscribing, not publishing.';
+    return null;
+  }
+  function match(filter, topic) {
+    const f = filter.split('/');
+    const t = topic.split('/');
+    if (topic.startsWith('$') && (f[0] === '+' || f[0] === '#')) {
+      return { ok: false, why: 'wildcards at the first level never match topics starting with $' };
+    }
+    for (let i = 0; i < f.length; i++) {
+      if (f[i] === '#') {
+        return { ok: true, why: i === 0 ? '"#" matches every topic' : '"#" matches all remaining levels' + (i >= t.length ? ', including the parent itself' : '') };
+      }
+      if (i >= t.length) return { ok: false, why: 'topic has only ' + t.length + ' level(s), filter needs ' + f.length };
+      if (f[i] === '+') continue;
+      if (f[i] !== t[i]) return { ok: false, why: 'level ' + (i + 1) + ': "' + t[i] + '" is not "' + f[i] + '"' };
+    }
+    if (f.length !== t.length) return { ok: false, why: 'topic has extra levels the filter does not cover' };
+    return { ok: true, why: f.includes('+') ? '"+" stood in for exactly one level' : 'exact match' };
+  }
+
+  // ---------- drawing ----------
+  function node(x, y, color, title, sub) {
+    const g = el('g', { transform: 'translate(' + x + ',' + y + ')' }, gNodes);
+    const rect = el('rect', { x: -80, y: -40, width: 160, height: 80, rx: 12, fill: C.node, stroke: color, 'stroke-width': 2 }, g);
+    const t1 = el('text', { class: 'node-title', 'text-anchor': 'middle', y: -14 }, g); t1.textContent = title;
+    const t2 = el('text', { class: 'node-sub', 'text-anchor': 'middle', y: 6 }, g); t2.textContent = sub;
+    const t3 = el('text', { class: 'node-last', 'text-anchor': 'middle', y: 26 }, g);
+    return { g, rect, t1, t2, t3 };
+  }
+  function flash(n, color) {
+    n.rect.setAttribute('fill', color);
+    n.rect.setAttribute('fill-opacity', '0.15');
+    setTimeout(() => { n.rect.setAttribute('fill', C.node); n.rect.setAttribute('fill-opacity', '1'); }, 450);
+  }
+  function shorten(s, n) { return s.length > n ? s.slice(0, n - 1) + '…' : s; }
+
+  el('line', { x1: PUB.x + 80, y1: PUB.y, x2: BROKER.x - 80, y2: BROKER.y, stroke: C.edge, 'stroke-width': 2 }, gLinks);
+  const pubNode = node(PUB.x, PUB.y, C.pub, 'Publisher', 'sensors');
+  pubNode.t3.textContent = 'sends PUBLISH';
+  const brokerNode = node(BROKER.x, BROKER.y, C.broker, 'Broker', 'matches filters');
+  brokerNode.t3.textContent = 'and fans out';
+  subs.forEach((s) => {
+    s.link = el('line', { x1: BROKER.x + 80, y1: BROKER.y, x2: SUB_X - 80, y2: s.y, stroke: C.edge, 'stroke-width': 2 }, gLinks);
+    s.node = node(SUB_X, s.y, C.ok, s.name, s.filter);
+    s.node.t3.textContent = 'nothing yet';
+    s.count = 0;
+  });
+
+  function packet(label, color) {
+    const g = el('g', { class: 'pkt' }, gPkts);
+    const w = Math.max(44, label.length * 7 + 18);
+    el('rect', { x: -w / 2, y: -12, width: w, height: 24, rx: 12, fill: color }, g);
+    const t = el('text', { 'text-anchor': 'middle', y: 4 }, g); t.textContent = label;
+    return g;
+  }
+  function move(g, x1, y1, x2, y2, ms) {
+    return new Promise((resolve) => {
+      const t0 = performance.now();
+      function frame(now) {
+        const p = Math.min(1, (now - t0) / ms);
+        const e = ease(p);
+        g.setAttribute('transform', 'translate(' + (x1 + (x2 - x1) * e) + ',' + (y1 + (y2 - y1) * e) + ')');
+        if (p < 1) requestAnimationFrame(frame); else resolve();
+      }
+      requestAnimationFrame(frame);
+    });
+  }
+
+  // ---------- log ----------
+  const logEl = document.getElementById('log');
+  let firstLog = true;
+  function logLine(parts) {
+    if (firstLog) { logEl.textContent = ''; firstLog = false; }
+    const li = document.createElement('li');
+    parts.forEach(([text, cls]) => {
+      const span = document.createElement('span');
+      if (cls) span.className = cls;
+      span.textContent = text;
+      li.appendChild(span);
+    });
+    logEl.prepend(li);
+  }
+
+  // ---------- publish ----------
+  async function publish(topic, payload) {
+    const label = shorten(topic, 30);
+    const p = packet(label, C.pub);
+    flash(pubNode, C.pub);
+    await move(p, PUB.x + 80, PUB.y, BROKER.x - 80, BROKER.y, 900);
+    p.remove();
+    flash(brokerNode, C.broker);
+    logLine([['PUBLISH ', 'dim'], [topic, ''], ['  payload=' + JSON.stringify(payload), 'dim']]);
+    await sleep(250);
+
+    const results = subs.map((s) => {
+      const bad = filterError(s.filter);
+      return { s, r: bad ? { ok: false, why: 'filter is invalid' } : match(s.filter, topic) };
+    });
+    results.forEach(({ s, r }) => {
+      logLine([['   ' + (r.ok ? '✓ ' : '✗ '), r.ok ? 'yes' : 'no'], [s.name + ' (' + s.filter + ') ', ''], [r.why, 'dim']]);
+    });
+    const matched = results.filter((x) => x.r.ok);
+    if (!matched.length) logLine([['   No subscriber matched, so the broker drops the message.', 'no']]);
+
+    results.filter((x) => !x.r.ok).forEach(({ s }) => {
+      s.link.setAttribute('stroke', C.bad);
+      s.link.setAttribute('stroke-dasharray', '4 4');
+      setTimeout(() => { s.link.setAttribute('stroke', C.edge); s.link.removeAttribute('stroke-dasharray'); }, 700);
+    });
+
+    await Promise.all(matched.map(async ({ s }) => {
+      const q = packet(label, C.ok);
+      await move(q, BROKER.x + 80, BROKER.y, SUB_X - 80, s.y, 900);
+      q.remove();
+      s.count += 1;
+      s.node.t3.textContent = shorten('#' + s.count + ' ' + topic.split('/').slice(-1)[0] + ': ' + payload, 22);
+      flash(s.node, C.ok);
+    }));
+  }
+
+  function fakePayload(topic) {
+    if (/temp/.test(topic)) return (18 + Math.random() * 6).toFixed(1) + '°C';
+    if (/humid/.test(topic)) return Math.round(35 + Math.random() * 30) + '%';
+    if (/door/.test(topic)) return Math.random() < 0.5 ? 'open' : 'closed';
+    return 'ok';
+  }
+
+  const presets = [
+    'home/kitchen/temperature',
+    'home/garage/temperature',
+    'home/kitchen/humidity',
+    'home/garage/door/state',
+    'home',
+    'office/printer/status'
+  ];
+  const presetBox = document.getElementById('presets');
+  presets.forEach((t) => {
+    const b = document.createElement('button');
+    b.textContent = t;
+    b.addEventListener('click', () => { publish(t, fakePayload(t)); });
+    presetBox.appendChild(b);
+  });
+
+  const topicIn = document.getElementById('topic');
+  const payloadIn = document.getElementById('payload');
+  const topicErr = document.getElementById('topicErr');
+  function checkTopic() {
+    const e = topicError(topicIn.value.trim());
+    topicErr.textContent = e || '';
+    topicIn.classList.toggle('invalid', !!e);
+    return !e;
+  }
+  topicIn.addEventListener('input', checkTopic);
+  document.getElementById('send').addEventListener('click', () => {
+    if (checkTopic()) publish(topicIn.value.trim(), payloadIn.value);
+  });
+
+  // ---------- filter editors ----------
+  const filterBox = document.getElementById('filters');
+  subs.forEach((s, i) => {
+    const lab = document.createElement('label');
+    lab.textContent = s.name;
+    lab.htmlFor = 'f' + i;
+    const inp = document.createElement('input');
+    inp.type = 'text'; inp.id = 'f' + i; inp.value = s.filter;
+    const err = document.createElement('div');
+    err.className = 'err';
+    inp.addEventListener('input', () => {
+      s.filter = inp.value.trim();
+      const e = filterError(s.filter);
+      err.textContent = e || '';
+      inp.classList.toggle('invalid', !!e);
+      s.node.t2.textContent = shorten(s.filter || '(empty)', 20);
+      s.node.rect.setAttribute('stroke', e ? C.bad : C.ok);
+    });
+    filterBox.append(lab, inp, err);
+  });
+
+  // ---------- guided tour ----------
+  let touring = false;
+  document.getElementById('tour').addEventListener('click', async () => {
+    if (touring) return;
+    touring = true;
+    for (const t of presets) {
+      await publish(t, fakePayload(t));
+      await sleep(700);
+    }
+    touring = false;
+  });
+
+  stage.setAttribute('data-ready', '1');
+})();
+</script>
+</body>
+</html>
